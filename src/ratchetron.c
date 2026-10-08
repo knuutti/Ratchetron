@@ -116,7 +116,17 @@ struct AsyncDataDesc {
     struct sockaddr_in sockaddr;
     int open;
     int tcp_sock_fd;
+    int slot;
 };
+
+// Every client thread and its async data thread own a slot, so ratchetron_shutdown() can
+// disconnect them and wait for them before the module's code is unloaded from under them.
+// The server thread claims a slot before starting a client thread, and each thread clears
+// its own flag as the very last thing before exiting.
+#define MAX_CLIENTS 8
+static volatile int client_sock[MAX_CLIENTS] = {NONE, NONE, NONE, NONE, NONE, NONE, NONE, NONE};
+static volatile u8 client_running[MAX_CLIENTS];
+static volatile u8 async_running[MAX_CLIENTS];
 
 int reallocating = 0;
 int debug_enabled = 0;
@@ -253,9 +263,12 @@ static void async_data_handle(u64 sa) {
     sprintf(buffer, "DEBUG: Data channel opening with: %s:%d", str, htons(sockaddr.sin_port));
     debug_msg(buffer);
 
+    int slot = desc->slot;
+
     int s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if(s < 0) {
         show_msg("Failed to open data channel");
+        async_running[slot] = 0;
         sys_ppu_thread_exit(0);
     }
 
@@ -265,7 +278,7 @@ static void async_data_handle(u64 sa) {
     sendto(s, msg, strlen(msg)+1, 0, &sockaddr, sizeof(struct sockaddr_in));
 
     u32 tick = 0;  // at 120 ticks per second it would take 414 days for this to overflow
-    while (desc->open == 1) {
+    while (desc->open == 1 && working) {
         if (reallocating == 1) {  // wait for reallocation to finish
             continue;
         }
@@ -391,13 +404,15 @@ static void async_data_handle(u64 sa) {
         tick++;
     }
 
-    free(desc);
+    socketclose(s);
+    async_running[slot] = 0;  // desc belongs to the client thread, which frees it after this
     sys_ppu_thread_exit(0);
 }
 
 static void handleclient_ps3mapi(u64 conn_s_ps3mapi_p)
 {
-    int conn_s = (int)conn_s_ps3mapi_p;         // main communications socket
+    int conn_s = (int)(u32)conn_s_ps3mapi_p;    // main communications socket
+    int slot = (int)(conn_s_ps3mapi_p >> 32);   // index into client_sock/client_running
 
     int connactive = 1;							// whether the ps3mapi connection is active or not
 
@@ -432,8 +447,10 @@ static void handleclient_ps3mapi(u64 conn_s_ps3mapi_p)
     sys_addr_t sysmem = NULL;
     if (sys_memory_allocate(BUFFER_SIZE_PS3MAPI, SYS_MEMORY_PAGE_SIZE_64K, &sysmem) != CELL_OK) {
         show_msg("Ratchetron can't allocate system memory.");
-        // We should unload ourselves at this point, but unloading doesn't work for some reason.
-        return;
+        sclose(&conn_s);
+        client_sock[slot] = NONE;
+        client_running[slot] = 0;
+        sys_ppu_thread_exit(0);
     }
 
     struct AsyncDataDesc *async_desc = malloc(sizeof(struct AsyncDataDesc));
@@ -560,11 +577,15 @@ static void handleclient_ps3mapi(u64 conn_s_ps3mapi_p)
 
                     async_desc->open = 1;
                     async_desc->tcp_sock_fd = conn_s;
+                    async_desc->slot = slot;
 
+                    async_running[slot] = 1;
 					// since the thread was never joined in the first place, we should use SYS_PPU_THREAD_CREATE_NORMAL to ensure the PS3 doesn't run out of threads to create.
 					if (sys_ppu_thread_create(&async_t_id, async_data_handle, (u64)async_desc, THREAD_PRIO_POLL, THREAD_STACK_SIZE_24KB, SYS_PPU_THREAD_CREATE_NORMAL, THREAD_NAME_ASYNC_DATA) == CELL_OK) {
 						send(conn_s, '\x01', 1, 0);
 					} else {
+						async_t_id = SYS_PPU_THREAD_NONE;
+						async_running[slot] = 0;
 						send(conn_s, '\x00', 1, 0);
 					}
                     break;
@@ -757,14 +778,26 @@ static void handleclient_ps3mapi(u64 conn_s_ps3mapi_p)
 
     sys_memory_free(sysmem);
 
-    sprintf(buffer, RATCHETRON_DISCONNECT_NOTIF, inet_ntoa(conn_info.remote_adr));
-    vshNotify_WithIcon(ICON_NETWORK, buffer);
+    if (working) {  // don't poke the VSH UI while it is shutting down
+        sprintf(buffer, RATCHETRON_DISCONNECT_NOTIF, inet_ntoa(conn_info.remote_adr));
+        vshNotify_WithIcon(ICON_NETWORK, buffer);
+    }
 
     remove_memory_sub_by_sock_fd(conn_s);
+    client_sock[slot] = NONE;
     sclose(&conn_s);
 
+    // Stop the async thread and wait for it before freeing the descriptor it reads.
     async_desc->open = 0;
+    for (int tries = 0; async_running[slot] && tries < 200; tries++) {  // up to 2 seconds
+        sys_timer_usleep(10000);
+    }
 
+    if (!async_running[slot]) {
+        free(async_desc);
+    }  // else leak it rather than free memory a stuck thread may still touch
+
+    client_running[slot] = 0;
     sys_ppu_thread_exit(0);
 }
 
@@ -815,13 +848,40 @@ void ps3mapi_thread(__attribute__((unused)) u64 arg)
                 sys_ppu_thread_t t_id;
 
                 if(working) {
-                    sys_ppu_thread_create(&t_id, handleclient_ps3mapi, (u64)conn_s_ps3mapi, THREAD_PRIO, THREAD_STACK_SIZE_PS3MAPI_CLI, SYS_PPU_THREAD_CREATE_NORMAL, THREAD02_NAME_PS3MAPI);
+                    int slot = NONE;
+                    for (int i = 0; i < MAX_CLIENTS; i++) {
+                        if (!client_running[i] && !async_running[i]) {
+                            slot = i;
+                            break;
+                        }
+                    }
+
+                    if (slot == NONE) {
+                        show_msg("Ratchetron: too many clients connected");
+                        sclose(&conn_s_ps3mapi);
+                        continue;
+                    }
+
+                    client_sock[slot] = conn_s_ps3mapi;
+                    client_running[slot] = 1;
+
+                    u64 client_arg = ((u64)slot << 32) | (u32)conn_s_ps3mapi;
+                    if (sys_ppu_thread_create(&t_id, handleclient_ps3mapi, client_arg, THREAD_PRIO, THREAD_STACK_SIZE_PS3MAPI_CLI, SYS_PPU_THREAD_CREATE_NORMAL, THREAD02_NAME_PS3MAPI) != CELL_OK) {
+                        client_sock[slot] = NONE;
+                        client_running[slot] = 0;
+                        sclose(&conn_s_ps3mapi);
+                    }
                 } else {
                     sclose(&conn_s_ps3mapi);
                     break;
                 }
             } else if((sys_net_errno == SYS_NET_EBADF) || (sys_net_errno == SYS_NET_ENETDOWN)) {
+                if(!working) {
+                    break;  // ratchetron_shutdown() closed the listen socket
+                }
+
                 sclose(&list_s);
+                active_socket[2] = NONE;
 
                 if(working) {
                     goto relisten;
@@ -831,12 +891,54 @@ void ps3mapi_thread(__attribute__((unused)) u64 arg)
             }
         }
         end:
-        sclose(&list_s);
+        if(working) {
+            sclose(&list_s);
+        }  // otherwise ratchetron_shutdown() already closed it; closing again could hit a reused fd
     } else {
         vshNotify_WithIcon(ICON_ERROR, (char *)"Ratchetron: Internal PS3MAPI version not supported!");
     }
 
-    free(memory_sub_area);
+    // memory_sub_area is freed in ratchetron_shutdown(), once no async thread can still be reading it
 
     sys_ppu_thread_exit(0);
+}
+
+void ratchetron_shutdown(void)
+{
+    working = 0;
+
+    // Closing the listen socket makes the blocked accept() in ps3mapi_thread return so it can exit.
+    int list_s = active_socket[2];
+    active_socket[2] = NONE;
+    sclose(&list_s);
+
+    // Wake every client blocked in recv()/send(). Only shutdown(), not socketclose(): the client
+    // thread still owns the fd and closes it itself, so it is never closed twice. Repeat it while
+    // waiting, in case a client was accepted just as `working` went to 0.
+    int all_done = 0;
+    for (int tries = 0; tries < 50 && !all_done; tries++) {  // up to 5 seconds
+        all_done = 1;
+
+        for (int i = 0; i < MAX_CLIENTS; i++) {
+            int fd = client_sock[i];
+            if (fd != NONE) {
+                shutdown(fd, SHUT_RDWR);
+            }
+
+            if (client_running[i] || async_running[i]) {
+                all_done = 0;
+            }
+        }
+
+        if (!all_done) {
+            sys_timer_usleep(100000);
+        }
+    }
+
+    // A thread that missed the deadline might still read the subscriptions; leaking them is
+    // better than crashing.
+    if (all_done && memory_sub_area != NULL) {
+        free(memory_sub_area);
+        memory_sub_area = NULL;
+    }
 }
