@@ -76,4 +76,9 @@ static sys_ppu_thread_t thread_id_data_channel_wait = SYS_PPU_THREAD_NONE;
 void ps3mapi_thread(__attribute__((unused)) u64 arg);
 void data_channel_wait_thread(__attribute__((unused)) u64 arg);
 
+// Stops the server, disconnects all clients and waits for every Ratchetron thread to finish.
+// Lives in ratchetron.c because the static state in this header is per translation unit:
+// main.c has its own copies of `working` and `active_socket` that the server never sees.
+void ratchetron_shutdown(void);
+
 #endif //RATCHETRON_H
